@@ -39,7 +39,7 @@
 
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, explode, split
+from pyspark.sql.functions import split, explode, col, concat_ws,arrays_zip, explode_outer
 
 # 初始化SparkSession
 spark = SparkSession.builder \
@@ -89,27 +89,24 @@ output_dir = "/media/scdx/D/wp/Yelp/Bigdata/data/"
 # unique_aircraft_types.coalesce(1).write.option("header", "true").csv(output_dir + "unique_aircraft_types.csv", mode="overwrite")
 
 
-# 假设df是你的DataFrame
-# 分别处理航空公司二字码和航空公司名称，确保它们在相同行上对齐
-airline_codes = df.select(explode(split(col("segmentsAirlineCode"), "\|\|")).alias("airline_code"))
-airline_names = df.select(explode(split(col("segmentsAirlineName"), "\|\|")).alias("airline_name"))
+# 首先，将每段航程的航空公司二字码和名称拆分成数组
+df = df.withColumn("segmentsAirlineCodeArray", split(col("segmentsAirlineCode"), "\|\|")) \
+       .withColumn("segmentsAirlineNameArray", split(col("segmentsAirlineName"), "\|\|"))
 
-# 假设每段航程的二字码和名称顺序是一致的，我们需要一个方法来保证行对齐
-# 一种简单的策略是添加行号作为新列，然后按行号join两个DataFrame
-from pyspark.sql.window import Window
-from pyspark.sql.functions import monotonically_increasing_id, row_number
+# 使用arrays_zip函数将二字码和名称组合成结构化数组
+df = df.withColumn("airlineInfo", arrays_zip("segmentsAirlineCodeArray", "segmentsAirlineNameArray"))
 
-# 为airline_codes和airline_names添加行号
-windowSpec  = Window.orderBy(monotonically_increasing_id())
-airline_codes = airline_codes.withColumn("row_num", row_number().over(windowSpec))
-airline_names = airline_names.withColumn("row_num", row_number().over(windowSpec))
+# 使用explode_outer展开结构化数组，并保留每个元素的结构
+df = df.withColumn("explodedAirlineInfo", explode_outer("airlineInfo"))
 
-# 根据行号join
-airline_info = airline_codes.join(airline_names, "row_num").select("airline_code", "airline_name")
+# 提取结构化数组中的二字码和名称
+df = df.withColumn("airlineCode", col("explodedAirlineInfo.segmentsAirlineCodeArray")) \
+       .withColumn("airlineName", col("explodedAirlineInfo.segmentsAirlineNameArray"))
 
-# 去除重复的行
-airline_info = airline_info.distinct()
+# 选择需要的列，并去重
+df_unique_airlines = df.select("airlineCode", "airlineName").distinct()
 
+df_unique_airlines.show(truncate=False)
 # 保存唯一航空公司二字码和名称为CSV
-airline_info.show(truncate=False)
-airline_info.coalesce(1).write.option("header", "true").csv(output_dir + "unique_airlines.csv", mode="overwrite")
+df_unique_airlines.show(truncate=False)
+df_unique_airlines.coalesce(1).write.option("header", "true").csv(output_dir + "unique_airlines.csv", mode="overwrite")
