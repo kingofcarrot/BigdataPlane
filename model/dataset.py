@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy import text
 import torch  # 确保导入了torch
 
+
 db_config = {
     'user': 'root',
     'password': '123456789@SCU',
@@ -15,13 +16,16 @@ db_config = {
 }
 
 class FlightDataset:
-    def __init__(self, db_config, mode='train'):
+    def __init__(self, db_config, mode='train', user_id=None, candidate_tickets_df=None):
         self.db_config = db_config
         self.mode = mode
+        self.user_id = user_id
+        self.candidate_tickets_df = candidate_tickets_df
         self.encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')  # 初始化 OneHotEncoder
         self.load_data()
         self.preprocess_data()
         self.encode_data()
+
 
     def load_data(self):
         # 使用 SQLAlchemy 创建数据库连接
@@ -29,18 +33,22 @@ class FlightDataset:
         engine = create_engine(database_uri)
 
         # 读取用户偏好数据
-        self.user_preferences = pd.read_sql("SELECT * FROM user_preference", engine)
-        # 读取用户飞行记录数据
-        self.flight_records = pd.read_sql("SELECT * FROM user_flight_records", engine)
-
-        if self.mode == 'eval':
-            # 如果处于评估模式，读取航班信息数据
-            self.flight_info = pd.read_sql("SELECT * FROM flight_info", engine)
+        if self.mode == 'eval' and self.user_id is not None:
+            query = f"SELECT * FROM user_preference WHERE user_id = {self.user_id}"
+            self.user_preferences = pd.read_sql(query, engine)
         else:
-            # 如果不是评估模式，初始化一个空的DataFrame
-            self.flight_info = pd.DataFrame()
+            self.user_preferences = pd.read_sql("SELECT * FROM user_preference", engine)
 
-        engine.dispose()  # 关闭数据库连接
+        # 读取用户飞行记录数据
+        self.flight_records = pd.DataFrame()
+        if self.mode == 'train':
+            self.flight_records = pd.read_sql("SELECT * FROM user_flight_records", engine)
+
+        if self.mode == 'eval' and self.candidate_tickets_df is not None:
+            self.flight_info = self.candidate_tickets_df
+        else:
+            self.flight_info = pd.DataFrame()
+        engine.dispose()
 
     def preprocess_data(self):
         # 确保所有的文本字段被转换为字符串类型
@@ -49,67 +57,68 @@ class FlightDataset:
             for col in categorical_cols:
                 df[col] = df[col].astype(str)
 
-        user_pref_categorical_cols = self.user_preferences.select_dtypes(include=['object', 'bool']).columns
-        convert_to_str(self.user_preferences, user_pref_categorical_cols)
+        if not self.user_preferences.empty:
+            user_pref_categorical_cols = self.user_preferences.select_dtypes(include=['object', 'bool']).columns
+            convert_to_str(self.user_preferences, user_pref_categorical_cols)
 
-        if self.mode == 'train':
+        if not self.flight_records.empty:
             flight_records_categorical_cols = self.flight_records.select_dtypes(include=['object', 'bool']).columns
             convert_to_str(self.flight_records, flight_records_categorical_cols)
-        elif self.mode == 'eval':
+
+        if not self.flight_info.empty:
             flight_info_categorical_cols = self.flight_info.select_dtypes(include=['object', 'bool']).columns
             convert_to_str(self.flight_info, flight_info_categorical_cols)
 
     def encode_data(self):
-        # 生成所有可能特征列的并集
-        all_columns = set(self.user_preferences.columns) | set(self.flight_records.columns) | set(
-            self.flight_info.columns)
+        user_pref_fields = ['price_sensitivity', 'preferred_airlines', 'stopover_preference', 'travel_class',
+                            'flight_time_preference', 'airport_preference', 'aircraft_type_preference',
+                            'flight_duration_preference', 'travel_distance_preference']
 
-        # 对于每个DataFrame，添加缺失的列，设置为""表示空值
-        for df in [self.user_preferences, self.flight_records, self.flight_info]:
-            for col in all_columns:
-                if col not in df.columns:
-                    df[col] = ""
+        flight_record_fields = ['flight_date', 'starting_airport', 'destination_airport', 'travel_duration',
+                                'is_non_stop', 'total_fare','segments_departure_time_epoch',
+                                'segments_arrival_time_epoch','segments_aircraft_description','segments_distance']
 
-        # 更新categorical_cols，因为已经添加了缺失的列
-        categorical_cols = list(all_columns.difference(['preference_id', 'user_id', 'record_id', 'flight_id']))
+        flight_info_fields = ['departureDate','startAirport','destAirport','travelDuration','notStop',
+                              'totalFare','segmentDepartureTime','segmentArrivalTime','segmentAircraftType','segmentDistance',]
 
-        # 将所有文本字段转换为字符串类型，确保独热编码可以正确应用
-        for df in [self.user_preferences, self.flight_records, self.flight_info]:
-            df[categorical_cols] = df[categorical_cols].astype(str)
+        # 根据模式确定使用的DataFrame
+        if self.mode == 'train':
+            data_to_fit = self.flight_records[flight_record_fields]
+        elif self.mode == 'eval':
+            data_to_fit = self.candidate_tickets_df[flight_info_fields]
 
-        # 初始化OneHotEncoder，并使用所有数据的并集进行fit，这确保了编码器能够识别所有可能的类别
-        self.encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
-        all_data = pd.concat([self.user_preferences[categorical_cols],
-                              self.flight_records[categorical_cols],
-                              self.flight_info[categorical_cols]], ignore_index=True)
-        self.encoder.fit(all_data)
+        self.user_pref_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore').fit(self.user_preferences[user_pref_fields])
 
-        # 分别对每个DataFrame的相关列进行transform，得到独热编码的结果
-        self.user_preferences_encoded = self.encoder.transform(self.user_preferences[categorical_cols])
-        self.flight_records_encoded = self.encoder.transform(self.flight_records[categorical_cols])
+        self.user_preferences_encoded = self.user_pref_encoder.transform(self.user_preferences[user_pref_fields])
+        user_pref_target_length = 17
+        if self.user_preferences_encoded.shape[1] < user_pref_target_length:
+            original_encoded = self.user_preferences_encoded
+            padded_encoded = np.zeros((1, user_pref_target_length))
+            padded_encoded[:, :original_encoded.shape[1]] = original_encoded
+            self.user_preferences_encoded = padded_encoded
 
-        # 检查flight_info是否为空，这是为了处理在非评估模式下可能不存在flight_info的情况
-        if not self.flight_info.empty:
-            self.flight_info_encoded = self.encoder.transform(self.flight_info[categorical_cols])
-        else:
-            # 为flight_info_encoded提供一个默认值，例如一个空数组，确保后续操作不会因为此变量是None而出错
-            self.flight_info_encoded = np.array([]).reshape(0, len(categorical_cols))  # 确保空数组的形状与编码器输出一致
+        # 编码飞行记录或候选机票信息
+        self.flight_info_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore').fit(data_to_fit)
+        if self.mode == 'train':
+            self.flight_records_encoded = self.flight_info_encoder.transform(self.flight_records[flight_record_fields])
+        elif self.mode == 'eval':
+            self.candidate_tickets_encoded = self.flight_info_encoder.transform(self.candidate_tickets_df[flight_info_fields])
 
     def __getitem__(self, idx):
-        user_pref = self.user_preferences_encoded[idx]
-        user_id = self.user_preferences.iloc[idx]['user_id']
-
         if self.mode == 'train':
-            matching_records_indices = self.flight_records['user_id'] == user_id
-            flight_records = self.flight_records_encoded[matching_records_indices]
+            user_pref = self.user_preferences_encoded[idx]
+            flight_records = self.flight_records_encoded[idx]
         elif self.mode == 'eval':
-            flight_records = self.flight_info_encoded
+            user_pref = self.user_preferences_encoded[0]
+            flight_records = self.candidate_tickets_encoded[idx]# 使用正确的属性名
 
-        # 将numpy数组转换为PyTorch tensor
-        user_pref = torch.tensor(user_pref, dtype=torch.float32)
-        flight_records = torch.tensor(flight_records, dtype=torch.float32)
+        if flight_records.shape[0] < 108:
+            original_encoded = flight_records
+            padded_encoded = np.zeros(108)
+            padded_encoded[:original_encoded.shape[0]] = original_encoded
+            flight_records = padded_encoded
 
-        return user_pref, flight_records
+        return torch.tensor(user_pref, dtype=torch.float32), torch.tensor(flight_records, dtype=torch.float32)
 
     def __len__(self):
             return len(self.user_preferences_encoded)

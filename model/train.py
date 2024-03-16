@@ -12,14 +12,12 @@ db_config = {
     'port': '3306',
     'database': 'flight_db',
 }
-
-# 设定训练参数
+user_pref_input_dim = 17  # 用户偏好输入特征维度
+flight_records_input_dim = 108  # 飞行记录输入特征维度
+hidden_dim = 64  # 隐藏层维度
 batch_size = 32
 learning_rate = 0.001
-epochs = 10
-input_dim = 358
-hidden_dim = 64
-output_dim = 1
+epochs = 30
 
 # 设备配置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,45 +27,29 @@ train_dataset = FlightDataset(db_config=db_config, mode='train')
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
 # 初始化模型和优化器
-model = FlightRecommendationModel(input_dim, hidden_dim, output_dim).to(device)
+model = FlightRecommendationModel(user_pref_input_dim, flight_records_input_dim, hidden_dim).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-criterion = torch.nn.BCELoss()
 
-def train(model, device, train_loader, optimizer, criterion):
+def train(model, device, train_loader, optimizer, epochs):
     model.train()
-    for batch_idx, (user_pref, flight_records) in enumerate(train_loader):
-        # 假设 user_pref 和 flight_records 都是numpy数组，需要转换为torch张量
-        user_pref = torch.tensor(user_pref).to(device).float()
-        flight_records = torch.tensor(flight_records).to(device).float()
+    for epoch in range(epochs):
+        total_loss = 0
+        for user_pref, flight_records in train_loader:
+            user_pref = user_pref.to(device).float()
+            flight_records = flight_records.to(device).float()
 
-        # 确保flight_records是二维的，如果是三维数据，使用view方法展平
-        if flight_records.dim() == 3:
-            flight_records = flight_records.view(flight_records.size(0), -1)
+            optimizer.zero_grad()
+            similarity = model(user_pref, flight_records)
+            # 损失函数是为了最大化相似度
+            loss = 1.0 - similarity.mean()  # 意图最大化相似度
+            loss.backward()
+            optimizer.step()
 
-        # 确保user_pref和flight_records维度相同
-        if user_pref.size(1) != flight_records.size(1):
-            print("Feature dimension mismatch: user_pref and flight_records should have the same number of features.")
-            return
+            total_loss += loss.item()
+        print(f'Epoch {epoch+1}, Average Loss: {total_loss / len(train_loader)}')
 
-        optimizer.zero_grad()
-        output = model(user_pref, flight_records)
-        labels = torch.ones_like(output)  # 假设所有样本都是正样本
-        loss = criterion(output, labels)
-        loss.backward()
-        optimizer.step()
+# 训练模型
+train(model, device, train_loader, optimizer, epochs)
 
-# 训练循环
-for epoch in range(epochs):
-    model.train()
-    train(model, device, train_loader, optimizer, criterion)
-    total_loss = 0
-    for user_pref, flight_records in train_loader:
-        user_pref = user_pref.to(device)
-        flight_records = flight_records.squeeze(1).to(device)  # 使用squeeze调整形状
-        optimizer.zero_grad()
-        output = model(user_pref, flight_records)
-        loss = criterion(output, torch.ones_like(output))  # 假设所有样本都是正样本
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    print(f"Epoch {epoch+1}, Loss: {total_loss/len(train_loader)}")
+# 保存模型参数
+torch.save(model.state_dict(), "flight_recommendation_model.pth")
