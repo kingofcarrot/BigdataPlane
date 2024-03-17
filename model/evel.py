@@ -40,6 +40,8 @@ def evaluate():
     candidate_tickets = request_data.get('candidate_tickets')
     candidate_tickets_df = pd.DataFrame(candidate_tickets)
 
+
+
     # 实例化数据集
     dataset = FlightDataset(db_config=db_config, mode='eval', user_id=user_id, candidate_tickets_df=candidate_tickets_df)
 
@@ -47,7 +49,7 @@ def evaluate():
     sorted_tickets = []
 
     # 使用模型进行评估
-    for i in range(len(dataset) + 1):
+    for i in range(len(candidate_tickets_df)):
         # 提取单个候选机票和用户偏好
         user_pref, flight_option = dataset[i]
 
